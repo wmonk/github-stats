@@ -1,5 +1,7 @@
 const {GraphQLClient} = require('graphql-request')
 const ora = require('ora')
+const percentile = require('percentile')
+const colors = require('colors/safe')
 
 const parse = require('date-fns/parse')
 const subDays = require('date-fns/sub_days')
@@ -10,6 +12,43 @@ const distanceInWordsStrict = require('date-fns/distance_in_words_strict')
 
 const {padEnd, each, zip, keys, values} = require('lodash/fp')
 
+const median = values => {
+    values.sort(function(a, b) {
+        return a - b
+    })
+
+    var half = Math.floor(values.length / 2)
+
+    if (values.length % 2) return values[half]
+    else return (values[half - 1] + values[half]) / 2.0
+}
+
+const logBlock = t => {
+    const lines = []
+    const emptyLines = []
+    return {
+        log: (...args) => lines.push(args),
+        logEmpty: (...args) => emptyLines.push(args),
+        end: () => {
+            console.log('')
+            console.log(colors.green.bold(`${t}:`))
+            const maxLength = lines.reduce((length, [line]) => {
+                if (line.length > length) return line.length
+                return length
+            }, 0)
+            each(([name, ...rest]) => {
+                console.log(' ', padEnd(maxLength, name), '=>', ...rest)
+            }, lines)
+
+            each((line) => {
+                console.log(' ', ...line)
+            }, emptyLines)
+
+            console.log('')
+        }
+    }
+}
+
 const args = require('yargs')
     .coerce({
         'start-date': Date.parse,
@@ -19,6 +58,7 @@ const args = require('yargs')
     .option('end-date', {default: subDays(new Date(), 0)})
     .option('repo-name', {required: true})
     .option('repo-owner', {required: true})
+    .option('base-branch', {default: 'master'})
     .option('token').argv
 
 const token = process.env.GH_TOKEN
@@ -33,9 +73,9 @@ const client = new GraphQLClient('https://api.github.com/graphql', {
 })
 
 const query = `
-query getPullRequests($name: String!, $owner: String!) {
+query getPullRequests($name: String!, $owner: String!, $baseBranch: String!) {
   repository(name: $name, owner: $owner) {
-    pullRequests(first:100,  orderBy: {field: CREATED_AT, direction: DESC}, baseRefName: "staging", states: [MERGED]) {
+    pullRequests(first:100,  orderBy: {field: UPDATED_AT, direction: DESC}, baseRefName: $baseBranch, states: [MERGED]) {
       nodes {
         number
         author {
@@ -56,27 +96,44 @@ const main = async () => {
     const spinner = ora('Analysing pull requests').start()
     const data = await client.request(query, {
         name: args.repoName,
-        owner: args.repoOwner
+        owner: args.repoOwner,
+        baseBranch: args.baseBranch
     })
     spinner.succeed()
     const startDate = args.startDate
     const endDate = args.endDate
 
     const prs = data.repository.pullRequests.nodes.filter(node => {
-        const createdAt = parse(node.createdAt)
-        return isBefore(createdAt, endDate) && isAfter(createdAt, startDate)
+        const mergedAt = parse(node.mergedAt)
+        return isBefore(mergedAt, endDate) && isAfter(mergedAt, startDate)
     })
 
-    console.log('')
-    console.log('Info:')
-    console.log('  Owner           =>', args.repoOwner)
-    console.log('  Repository name =>', args.repoName)
-    console.log('  From            =>', format(args.startDate, 'YYYY-MM-DD'))
-    console.log('  To              =>', format(args.endDate, 'YYYY-MM-DD'))
-    console.log('  Total           =>', prs.length)
+    const infoBlock = logBlock('Info')
+    infoBlock.log('Owner', args.repoOwner)
+    infoBlock.log('Repository name', args.repoName)
+    infoBlock.log('From', format(args.startDate, 'YYYY-MM-DD'))
+    infoBlock.log('To', format(args.endDate, 'YYYY-MM-DD'))
+    infoBlock.log('Total', prs.length)
+    infoBlock.end()
 
-    console.log('')
-    console.log('Count by author:')
+    const prBlock = logBlock('Pull requests')
+    const now = Date.now()
+    const f = prs.map(a => a).sort((a, b) => {
+        const aOpenTime = new Date(a.mergedAt) - new Date(a.createdAt)
+        const bOpenTime = new Date(b.mergedAt) - new Date(b.createdAt)
+        return aOpenTime - bOpenTime
+    })
+    f.map(pr => {
+        const openTime = new Date(pr.mergedAt) - new Date(pr.createdAt)
+        prBlock.logEmpty(
+            pr.title,
+            `- ${distanceInWordsStrict(now, now + openTime)}`,
+            `(#${pr.number})`,
+        )
+    })
+    prBlock.end()
+
+    const authorBlock = logBlock('Count by author')
     const authors = prs.reduce((owners, pr) => {
         const login = pr.author.login
         if (owners[login]) {
@@ -86,13 +143,12 @@ const main = async () => {
         }
         return owners
     }, {})
-    const longestName = Math.max(...Object.keys(authors).map(a => a.length))
-    each(([name, count]) => {
-        console.log(' ', padEnd(longestName, name), '=>', count)
-    }, zip(keys(authors), values(authors)))
 
-    console.log('')
-    console.log('Time to merge:')
+    each(([name, count]) => authorBlock.log(name, count), zip(keys(authors), values(authors)))
+    authorBlock.end()
+
+
+    const mergeBlock = logBlock('Time to merge')
     const shortest = prs.reduce((a, b) => {
         if (!a) return b
         const aOpenTime = new Date(a.mergedAt) - new Date(a.createdAt)
@@ -109,13 +165,13 @@ const main = async () => {
         if (bOpenTime > aOpenTime) return b
         return a
     }, null)
-    console.log(
-        '  Shortest     =>',
+    mergeBlock.log(
+        'Shortest',
         distanceInWordsStrict(shortest.createdAt, shortest.mergedAt),
         `(#${shortest.number})`
     )
-    console.log(
-        '  Longest      =>',
+    mergeBlock.log(
+        'Longest',
         distanceInWordsStrict(longest.createdAt, longest.mergedAt),
         `(#${longest.number})`
     )
@@ -125,13 +181,33 @@ const main = async () => {
         return a + openTime
     }, 0)
     const meanInMs = total / prs.length
-    const now = Date.now()
     const fut = now + meanInMs
-    console.log('  Mean (days)  =>', distanceInWordsStrict(now, fut))
-    console.log(
-        '  Mean (hours) =>',
+    mergeBlock.log('Mean (days)', distanceInWordsStrict(now, fut))
+    mergeBlock.log(
+        'Mean (hours)',
         distanceInWordsStrict(now, fut, {unit: 'h'})
     )
+
+    const allTimes = prs.map(pr => {
+        const openTime = new Date(pr.mergedAt) - new Date(pr.createdAt)
+        return openTime
+    })
+    mergeBlock.log(
+        'Median',
+        distanceInWordsStrict(now, now + median(allTimes))
+    )
+
+    const percentileVals = prs.map(pr => {
+        const openTime = new Date(pr.mergedAt) - new Date(pr.createdAt)
+        return {...pr, openTime}
+    })
+    const p90 = percentile(90, percentileVals, item => item.openTime)
+    mergeBlock.log(
+        'p90',
+        distanceInWordsStrict(now, now + p90.openTime),
+        `(#${p90.number})`
+    )
+    mergeBlock.end()
 }
 
 main().catch(console.error)
